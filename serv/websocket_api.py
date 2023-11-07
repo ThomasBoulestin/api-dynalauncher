@@ -82,11 +82,16 @@ def handle_message(request):
 @method
 def fileExists(input) -> Result:
 
-    if(os.path.isfile(input)):
+    if "d3dump" in input:
+        p = Path(input)
+        for f in os.listdir(p.parent.absolute()):
+            if p.name in f:
+                return Success(True)
+
+    if (os.path.isfile(input)):
         return Success(True)
     else:
         return Success(False)
-
 
 
 @method
@@ -101,15 +106,18 @@ def getLicCount() -> Result:
     s.append(job_manager.queue_manager.get_cpu_count())
     return Success(s)
 
+
 @method
 def getQrunJobs() -> Result:
     s = get_qrun_jobs()
     return Success(s)
 
+
 @method
 def qKillJob(host) -> Result:
     b, message = qkill_job(host)
-    return Success({"success" : b, "message": message})
+    return Success({"success": b, "message": message})
+
 
 @method
 def isjobRunning(input):

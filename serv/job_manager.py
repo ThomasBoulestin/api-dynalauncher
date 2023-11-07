@@ -20,6 +20,7 @@ import sys
 
 LICENSE_SERVER = ""
 
+
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
@@ -87,7 +88,7 @@ def get_qrun_jobs(server="") -> List[Dict]:
                 read = True
                 continue
 
-            if len(line.split() ) < 5:
+            if len(line.split()) < 5:
                 read = False
                 continue
 
@@ -103,7 +104,6 @@ def get_qrun_jobs(server="") -> List[Dict]:
                         "josbs":  l[8]
                     }
                 )
-
 
     except:
         return []
@@ -132,13 +132,13 @@ def qkill_job(host, server="") -> tuple[bool, str]:
 
         if "procid@machine" in stdout_as_str:
             return False, stdout_as_str
-        
+
         if "License server cannot find" in stdout_as_str:
             return False, stdout_as_str
-        
+
         if "You are not authorized to terminate this job" in stdout_as_str:
             return False, stdout_as_str
-        
+
         if "Program queued for termination" in stdout_as_str:
             return True, stdout_as_str
 
@@ -146,7 +146,6 @@ def qkill_job(host, server="") -> tuple[bool, str]:
         return False, "unknown error"
 
     return False, "unknown error"
-
 
 
 class JobManager:
@@ -302,7 +301,6 @@ class JobManager:
         return out_var
 
 
-
 def job_watchdog_task(j_m) -> None:
     """Task to be launched as a daemonic Thread
 
@@ -344,8 +342,6 @@ def job_watchdog_task(j_m) -> None:
                 pass
 
         sleep(5)
-
-
 
 
 def queue_timer_task(j_m: JobManager) -> None:
@@ -391,7 +387,7 @@ class Job:
         self.sq_job = sq_job
         self.app = app
         self.job_manager = job_manager
-        self.j_connect = j_connect # if we are trying to connect to an existing job
+        self.j_connect = j_connect  # if we are trying to connect to an existing job
 
         self.shell_content = deque()
 
@@ -422,12 +418,8 @@ class Job:
                         # print("    " + str(p.pid))
                         pid_to_write = p.pid
 
-
             except psutil.NoSuchProcess:
                 print("noprocess")
-                
-        
-            
 
             with open(
                 os.path.join(self.working_dir, "pid"), "w", encoding="utf-8"
@@ -679,7 +671,6 @@ class StdoutWatchdogThread(Thread):
             if not psutil.pid_exists(self.job.sq_job.pid):
                 break
 
-
         pos, actual_time, to_add, json_f = self.readFile(pos, actual_time)
 
         self.job.update_db(json_f)
@@ -688,7 +679,6 @@ class StdoutWatchdogThread(Thread):
         self.exit.wait(sleep_time)
 
         # self.job.stop()
-
 
     def readFile(self, pos, actual_time):
         with open(os.path.join(self.working_dir, "stdout"), "rb") as file:
@@ -774,6 +764,10 @@ class StdoutWatchdogThread(Thread):
                     json_f["status"] = "Error"
                     self.job.update_db(json_f)
 
+                if "Segmentation Violation" in line:
+                    json_f["status"] = "Error"
+                    self.job.update_db(json_f)
+
                 if "N o r m a l" in line and self.job.status not in ["sw1"]:
                     if self.job.update_status != "":
                         json_f["status"] = self.job.update_status
@@ -782,11 +776,8 @@ class StdoutWatchdogThread(Thread):
                         json_f["current"] = self.job.sq_job.end
 
                     self.job.update_db(json_f)
-                    
 
         return pos, actual_time, to_add, json_f
-
-
 
 
 class QueueManager:
@@ -869,5 +860,3 @@ class QueueManager:
             count += int(j["ncpu"])
 
         return count
-
-

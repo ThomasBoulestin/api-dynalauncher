@@ -9,8 +9,6 @@ from serv.job_manager import LICENSE_SERVER
 from os import system
 
 
-
-
 ART = """
            _____ _____      _____                    _                            _               
      /\   |  __ \_   _|    |  __ \                  | |                          | |              
@@ -19,12 +17,10 @@ ART = """
   / ____ \| |    _| |_     | |__| | |_| | | | | (_| | |___| (_| | |_| | | | | (__| | | |  __/ |   
  /_/    \_\_|   |_____|    |_____/ \__, |_| |_|\__,_|______\__,_|\__,_|_| |_|\___|_| |_|\___|_|   
                                     __/ |                                                         
-                                   |___/     2.0.0"""
+                                   |___/     2.0.1"""
 
 init()
 print(Fore.BLUE + ART + Style.RESET_ALL)
-
-
 
 
 app = Flask(__name__)
@@ -39,15 +35,16 @@ with app.app_context():
     db.create_all()
 
 
-socketio.init_app(app, cors_allowed_origins='*', async_mode='gevent', logger=False)
+socketio.init_app(app, cors_allowed_origins='*',
+                  async_mode='gevent', logger=False)
 job_manager.set_context(app)
 
 
 if __name__ == '__main__':
-    system("title " + "api-dynalauncher 2.0.0")
+    system("title " + "api-dynalauncher 2.0.1")
 
-    port=5558
-    host= '0.0.0.0'
+    port = 5558
+    host = '0.0.0.0'
 
     print()
     print(Fore.GREEN + f'Listening on ' + Fore.RED + f'{host}:{port}')
@@ -61,6 +58,3 @@ if __name__ == '__main__':
         print()
         print(Fore.RED + f'Server is already running on port {port}')
         print(Style.RESET_ALL)
-
-
-
