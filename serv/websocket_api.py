@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from pathlib import Path
 import signal
 from typing import List
@@ -104,7 +105,20 @@ def getFullJobList() -> Result:
 def getLicCount() -> Result:
     s = get_lic_count()
     s.append(job_manager.queue_manager.get_cpu_count())
+
     return Success(s)
+
+
+@method
+def getFreeSpace(disk) -> Result:
+    KB = 1024
+    MB = 1024 * KB
+    GB = 1024 * MB
+
+    try:
+        return Success((disk, shutil.disk_usage('C:').free / GB, shutil.disk_usage('C:').total / GB))
+    except:
+        return Success((f'error reading {disk}', 0, 0))
 
 
 @method
@@ -278,6 +292,7 @@ def getRunningShells():
 @method
 def removeShell(id):
     if int(id) in job_manager.jobs:
+
         job_manager.remove_from_manager(int(id))
 
         socketio.emit("message", json.dumps({"jsonrpc": "2.0", "method": "removeShell",

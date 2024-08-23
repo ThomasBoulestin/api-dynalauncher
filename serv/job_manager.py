@@ -32,7 +32,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-def get_lic_count(server="") -> List[int]:
+def get_lic_count(server="colas41096") -> List[int]:
     """Return LsDyna license server informations using lstc_qrun.exe
     :param server: Name or IP of the lic server. If "", LSTC_LICENSE_SERVER
                            env variable is used
@@ -111,7 +111,7 @@ def get_qrun_jobs(server="") -> List[Dict]:
     return out_list
 
 
-def qkill_job(host, server="") -> tuple[bool, str]:
+def qkill_job(host, server="") -> [bool, str]:
     """Return LsDyna license server running jobs informations using lstc_qrun.exe
     :param server: Name or IP of the lic server. If "", LSTC_LICENSE_SERVER
                            env variable is used
@@ -251,6 +251,12 @@ class JobManager:
 
     def remove_from_manager(self, job_id):
         """delete Job from job manager"""
+        try:
+            self.jobs[job_id].stop()
+            self.jobs[job_id].update_db({"status": "Stopped"})
+        except:
+            pass
+
         del self.jobs[job_id]
 
     def connect_to_job(self, j: SqlJob) -> None:

@@ -17,7 +17,7 @@ ART = """
   / ____ \| |    _| |_     | |__| | |_| | | | | (_| | |___| (_| | |_| | | | | (__| | | |  __/ |   
  /_/    \_\_|   |_____|    |_____/ \__, |_| |_|\__,_|______\__,_|\__,_|_| |_|\___|_| |_|\___|_|   
                                     __/ |                                                         
-                                   |___/     2.0.1"""
+                                   |___/     2.0.3"""
 
 init()
 print(Fore.BLUE + ART + Style.RESET_ALL)
@@ -41,9 +41,9 @@ job_manager.set_context(app)
 
 
 if __name__ == '__main__':
-    system("title " + "api-dynalauncher 2.0.1")
+    system("title " + "api-dynalauncher 2.0.3")
 
-    port = 5558
+    port = 5568
     host = '0.0.0.0'
 
     print()
