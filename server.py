@@ -5,11 +5,13 @@ from serv.websocket_api import socketio, job_manager
 from jsonrpcserver import method, Result, Success, dispatch
 from colorama import Fore, Back, Style, init
 from engineio.async_drivers import gevent
-from serv.job_manager import LICENSE_SERVER
 from os import system
+import argparse
+
+VERSION = "2.0.4"
 
 
-ART = """
+ART = f"""
            _____ _____      _____                    _                            _               
      /\   |  __ \_   _|    |  __ \                  | |                          | |              
     /  \  | |__) || |______| |  | |_   _ _ __   __ _| |     __ _ _   _ _ __   ___| |__   ___ _ __ 
@@ -17,7 +19,7 @@ ART = """
   / ____ \| |    _| |_     | |__| | |_| | | | | (_| | |___| (_| | |_| | | | | (__| | | |  __/ |   
  /_/    \_\_|   |_____|    |_____/ \__, |_| |_|\__,_|______\__,_|\__,_|_| |_|\___|_| |_|\___|_|   
                                     __/ |                                                         
-                                   |___/     2.0.3"""
+                                   |___/     {VERSION}"""
 
 init()
 print(Fore.BLUE + ART + Style.RESET_ALL)
@@ -35,22 +37,32 @@ with app.app_context():
     db.create_all()
 
 
+# parser = argparse.ArgumentParser(description='')
+# # Optional positional argument
+# parser.add_argument('--lic_server', type=str, default='localhost',
+#                     help='license server address')
+# ARGS = parser.parse_args()
+
+
 socketio.init_app(app, cors_allowed_origins='*',
                   async_mode='gevent', logger=False)
 job_manager.set_context(app)
 
 
 if __name__ == '__main__':
-    system("title " + "api-dynalauncher 2.0.3")
+
+    # print(args.lic_server)
+
+    system("title " + f"api-dynalauncher {VERSION}")
 
     port = 5568
     host = '0.0.0.0'
 
     print()
     print(Fore.GREEN + f'Listening on ' + Fore.RED + f'{host}:{port}')
+    print(Fore.GREEN + f'License server ' +
+          Fore.RED + f'LSTC_LICENSE_SERVER env var')
     print(Style.RESET_ALL)
-
-    LICENSE_SERVER = "colas41096"
 
     try:
         socketio.run(app, host=host, port=port, debug=False)

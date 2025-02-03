@@ -18,8 +18,6 @@ from colorama import Fore, Back, Style, init
 from typing import List, Dict
 import sys
 
-LICENSE_SERVER = ""
-
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -32,7 +30,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-def get_lic_count(server="colas41096") -> List[int]:
+def get_lic_count(server='') -> List[int]:
     """Return LsDyna license server informations using lstc_qrun.exe
     :param server: Name or IP of the lic server. If "", LSTC_LICENSE_SERVER
                            env variable is used
