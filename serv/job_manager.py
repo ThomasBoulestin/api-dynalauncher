@@ -38,23 +38,27 @@ def get_lic_count(server='') -> List[int]:
     return (used, max) as integers
     """
 
-    exe = resource_path(r"dyna-tools/lstc_qrun")
+    exe = resource_path(r"dyna-tools/lstc_qrun.exe")
     command = [exe, "-r"]
 
     if server != "":
         command.append("-s")
         command.append(server)
 
+    used = -1
+    max_ = 0
+
     try:
         process = subprocess.run(
-            command, capture_output=True, check=False
+            command, capture_output=True, check=False, timeout=2
         )
         stdout_as_str = process.stdout.decode("utf-8")
         stdout_split = stdout_as_str.split()
         max_ = int(stdout_split[-3])
         used = int(stdout_split[-5])
-    except:
-        return [0, 0]
+    except Exception as e:
+        print(e)
+        return [-2, 0]
 
     return [used, max_]
 
@@ -76,7 +80,7 @@ def get_qrun_jobs(server="") -> List[Dict]:
 
     try:
         process = subprocess.run(
-            command, capture_output=True, check=False
+            command, capture_output=True, check=False, timeout=2
         )
         stdout_as_str = process.stdout.decode("utf-8")
 
@@ -124,7 +128,7 @@ def qkill_job(host, server="") -> [bool, str]:
 
     try:
         process = subprocess.run(
-            command, capture_output=True, check=False
+            command, capture_output=True, check=False, timeout=1
         )
         stdout_as_str = process.stdout.decode("utf-8")
 
@@ -765,6 +769,10 @@ class StdoutWatchdogThread(Thread):
                     self.job.update_db(json_f)
 
                 if "E r r o r" in line:
+                    json_f["status"] = "Error"
+                    self.job.update_db(json_f)
+
+                if "BAD TERMINATION" in line:
                     json_f["status"] = "Error"
                     self.job.update_db(json_f)
 

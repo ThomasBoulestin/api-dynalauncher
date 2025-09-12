@@ -3,6 +3,7 @@ from flask import Flask
 
 db = SQLAlchemy()
 
+
 class SqlJob(db.Model):
     """Standard SQL Alchemy Job object
     """
@@ -23,6 +24,7 @@ class SqlJob(db.Model):
     expr = db.Column(db.String(300), unique=False, nullable=True)
     a_mass = db.Column(db.Float, unique=False, nullable=True)
     pct_mass = db.Column(db.Float, unique=False, nullable=True)
+    sender = db.Column(db.String(300), unique=False, nullable=True)
 
     def __repr__(self):
         return f"<SqlJob {self.id}>"
@@ -39,6 +41,28 @@ def init_db() -> None:
     with app.app_context():
         db.create_all()
 
+
+def ensure_schema() -> None:
+    """Ensure DB schema is up-to-date for existing databases.
+
+    - Adds missing columns that were introduced after initial table creation.
+    Currently handled: `sender` column on `SqlJob`.
+    """
+    # Accessing db.engine requires an app context; caller must ensure it.
+    from sqlalchemy import text
+
+    table_name = SqlJob.__table__.name
+
+    # Use a transaction-safe connection for DDL
+    with db.engine.begin() as conn:
+        # Get existing columns via PRAGMA for SQLite
+        pragma = conn.execute(text(f'PRAGMA table_info("{table_name}")'))
+        existing_cols = {row[1] for row in pragma.fetchall()}
+
+        if "sender" not in existing_cols:
+            # Add the new column as nullable VARCHAR(300)
+            conn.execute(
+                text(f'ALTER TABLE "{table_name}" ADD COLUMN sender VARCHAR(300)'))
 
 
 if __name__ == "__main__":

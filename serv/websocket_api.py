@@ -40,6 +40,7 @@ def sqlJobRequestToList(sql_job_list) -> List[dict]:
         "expr": j.expr,
         "a_mass": j.a_mass,
         "pct_mass": j.pct_mass,
+        "sender": j.sender if hasattr(j, 'sender') else None,
     } for j in sql_job_list]
 
 
@@ -97,8 +98,13 @@ def fileExists(input) -> Result:
 
 @method
 def getFullJobList() -> Result:
-    jbs = SqlJob.query.order_by(desc(SqlJob.id)).limit(-1)
+    jbs = SqlJob.query.order_by(desc(SqlJob.id)).limit(500)
     return Success(sqlJobRequestToList(jbs))
+
+# @method
+# def getNthJob(n) -> Result:
+#     jbs = SqlJob.query.filter_by(SqlJob.id).order_by(desc(SqlJob.id)).limit(-1)
+#     return Success(sqlJobRequestToList(jbs))
 
 
 @method
@@ -283,6 +289,7 @@ def getRunningShells():
             "expr": job.sq_job.expr,
             "a_mass": job.sq_job.a_mass,
             "pct_mass": job.sq_job.pct_mass,
+            "sender": job.sq_job.sender if hasattr(job.sq_job, 'sender') else None,
             "stdout": ''.join(job.get_shell_content())
         })
 

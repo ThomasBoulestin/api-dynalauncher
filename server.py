@@ -1,6 +1,6 @@
 
 from flask import Flask, render_template, request, send_from_directory
-from serv.models import db
+from serv.models import db, ensure_schema
 from serv.websocket_api import socketio, job_manager
 from jsonrpcserver import method, Result, Success, dispatch
 from colorama import Fore, Back, Style, init
@@ -8,7 +8,7 @@ from engineio.async_drivers import gevent
 from os import system
 import argparse
 
-VERSION = "2.0.4"
+VERSION = "2.0.6"
 
 
 ART = f"""
@@ -35,13 +35,15 @@ db.init_app(app)
 
 with app.app_context():
     db.create_all()
+    # Ensure existing databases are upgraded with new columns
+    ensure_schema()
 
 
-# parser = argparse.ArgumentParser(description='')
-# # Optional positional argument
-# parser.add_argument('--lic_server', type=str, default='localhost',
-#                     help='license server address')
-# ARGS = parser.parse_args()
+parser = argparse.ArgumentParser(description='')
+# Optional positional argument
+parser.add_argument('--port', type=int, default=5568,
+                    help='server port to use')
+ARGS = parser.parse_args()
 
 
 socketio.init_app(app, cors_allowed_origins='*',
@@ -55,7 +57,7 @@ if __name__ == '__main__':
 
     system("title " + f"api-dynalauncher {VERSION}")
 
-    port = 5568
+    port = ARGS.port
     host = '0.0.0.0'
 
     print()
