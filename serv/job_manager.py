@@ -240,6 +240,7 @@ class JobManager:
             ncpu=int(j_json["ncpu"]),
             expr=j_json["expr"],
             memory=j_json["memory"],
+            sender=j_json["sender"],
         )
 
         with self.app.app_context():
