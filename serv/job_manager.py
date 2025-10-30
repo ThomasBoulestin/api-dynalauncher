@@ -6,8 +6,8 @@ from pathlib import Path
 import subprocess
 from time import sleep
 import time
-from typing import Tuple
-from threading import Event, Thread
+from typing import Tuple, Optional
+from threading import Event, Thread, Lock
 import psutil
 
 from flask import Flask
@@ -17,6 +17,169 @@ from serv.models import SqlJob, db
 from colorama import Fore, Back, Style, init
 from typing import List, Dict
 import sys
+
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+
+class CoreAllocator:
+    """Manages CPU core allocation for jobs
+
+    Tracks physical and logical cores, hyper-threading status,
+    and allocates cores to jobs to prevent over-subscription.
+    """
+
+    def __init__(self) -> None:
+        """Initialize core allocator with system CPU information"""
+        self.physical_cores = psutil.cpu_count(logical=False)
+        self.logical_cores = psutil.cpu_count(logical=True)
+        self.hyper_threading_enabled = self.logical_cores > self.physical_cores
+
+        # List of core dictionaries: {'index': int, 'job_id': Optional[int], 'pid': Optional[int]}
+        self.cores = [
+            {'index': i, 'job_id': None, 'pid': None}
+            for i in range(self.logical_cores)
+        ]
+
+        # Lock for thread-safe core allocation
+        self.lock = Lock()
+
+        print(
+            Fore.GREEN + "CPU Information:" + Style.RESET_ALL +
+            f"\n  Physical cores: {self.physical_cores}" +
+            f"\n  Logical cores: {self.logical_cores}" +
+            f"\n  Hyper-threading: {'Enabled' if self.hyper_threading_enabled else 'Disabled'}"
+        )
+
+    def allocate_cores(self, job_id: int, pid: int, num_cores: int) -> Optional[List[int]]:
+        """Allocate cores for a job
+
+        :param job_id: Job ID requesting cores
+        :param pid: Process ID of the job
+        :param num_cores: Number of physical cores requested (will allocate 2x if HT enabled)
+        :return: List of allocated core indices, or None if not enough cores available
+        """
+        with self.lock:
+            # If hyper-threading is enabled, allocate 2x the cores
+            cores_to_allocate = num_cores * 2 if self.hyper_threading_enabled else num_cores
+
+            # Find available cores
+            available_cores = [
+                core for core in self.cores if core['job_id'] is None]
+
+            if len(available_cores) < cores_to_allocate:
+                print(
+                    Fore.YELLOW +
+                    f"Warning: Not enough cores available. Requested: {num_cores} ({'HT: ' + str(cores_to_allocate) if self.hyper_threading_enabled else cores_to_allocate}), Available: {len(available_cores)}" +
+                    Style.RESET_ALL
+                )
+                return None
+
+            # Allocate the requested number of cores
+            allocated_indices = []
+            for i in range(cores_to_allocate):
+                core = available_cores[i]
+                core['job_id'] = job_id
+                core['pid'] = pid
+                allocated_indices.append(core['index'])
+
+            ht_info = f" (HT: {num_cores} physical = {cores_to_allocate} logical)" if self.hyper_threading_enabled else ""
+            print(
+                Fore.CYAN +
+                f"Allocated cores {allocated_indices[0]}-{allocated_indices[-1]} to job {job_id} (PID: {pid}){ht_info}" +
+                Style.RESET_ALL
+            )
+
+            return allocated_indices
+
+    def allocate_specific_cores(self, job_id: int, pid: int, core_indices: List[int]) -> Optional[List[int]]:
+        """Attempt to allocate specific cores for a job (used for restore after restart)
+
+        :param job_id: Job ID requesting cores
+        :param pid: Process ID of the job
+        :param core_indices: List of specific core indices to allocate
+        :return: List of allocated core indices if successful, or None if cores unavailable
+        """
+        with self.lock:
+            # Check if all requested cores are available
+            for idx in core_indices:
+                if idx >= len(self.cores):
+                    print(
+                        Fore.YELLOW +
+                        f"Warning: Core index {idx} out of range (max: {len(self.cores)-1})" +
+                        Style.RESET_ALL
+                    )
+                    return None
+                if self.cores[idx]['job_id'] is not None:
+                    print(
+                        Fore.YELLOW +
+                        f"Warning: Requested core {idx} already allocated to job {self.cores[idx]['job_id']}" +
+                        Style.RESET_ALL
+                    )
+                    return None
+
+            # All requested cores are available - allocate them
+            for idx in core_indices:
+                self.cores[idx]['job_id'] = job_id
+                self.cores[idx]['pid'] = pid
+
+            print(
+                Fore.CYAN +
+                f"Allocated specific cores {core_indices} to job {job_id} (PID: {pid})" +
+                Style.RESET_ALL
+            )
+
+            return core_indices
+
+    def release_cores(self, job_id: int) -> List[int]:
+        """Release cores allocated to a job
+
+        :param job_id: Job ID to release cores for
+        :return: List of released core indices
+        """
+        with self.lock:
+            released_indices = []
+            for core in self.cores:
+                if core['job_id'] == job_id:
+                    released_indices.append(core['index'])
+                    core['job_id'] = None
+                    core['pid'] = None
+
+            if released_indices:
+                print(
+                    Fore.LIGHTMAGENTA_EX +
+                    f"Released cores {released_indices[0]}-{released_indices[-1]} from job {job_id}" +
+                    Style.RESET_ALL
+                )
+
+            return released_indices
+
+    def get_available_cores_count(self) -> int:
+        """Get number of currently available cores"""
+        with self.lock:
+            return sum(1 for core in self.cores if core['job_id'] is None)
+
+    def get_core_allocation_status(self) -> Dict:
+        """Get current core allocation status
+
+        :return: Dictionary with allocation information
+        """
+        with self.lock:
+            return {
+                'physical_cores': self.physical_cores,
+                'logical_cores': self.logical_cores,
+                'hyper_threading_enabled': self.hyper_threading_enabled,
+                'available_cores': self.get_available_cores_count(),
+                'cores': [dict(core) for core in self.cores]  # Return copy
+            }
 
 
 def resource_path(relative_path):
@@ -162,7 +325,27 @@ class JobManager:
         self.jobs = {}
         self.app = None
 
+        # Configuration options
+        self.disable_intel_mpi_core_allocation = False
+
+        # Initialize core allocator
+        self.core_allocator = CoreAllocator()
+
         self.queue_manager = QueueManager(socketio, self)
+
+    def configure(self, disable_intel_mpi_core_allocation: bool = False) -> None:
+        """Configure JobManager options
+
+        :param disable_intel_mpi_core_allocation: If True, disable Intel MPI core allocation and pinning
+        """
+        self.disable_intel_mpi_core_allocation = disable_intel_mpi_core_allocation
+
+        if disable_intel_mpi_core_allocation:
+            print(
+                Fore.YELLOW +
+                "Intel MPI core allocation disabled - jobs will not be pinned to specific cores" +
+                Style.RESET_ALL
+            )
 
     def set_context(self, app: Flask) -> None:
         """
@@ -260,6 +443,9 @@ class JobManager:
         except:
             pass
 
+        # Note: Cores are now released when job status changes to terminal state (Finished/Error/Stopped)
+        # not when removed from manager. The stop() method has a safety fallback if needed.
+
         del self.jobs[job_id]
 
     def connect_to_job(self, j: SqlJob) -> None:
@@ -299,6 +485,13 @@ class JobManager:
                                    )
         except IndexError:
             return
+
+    def get_core_allocation_status(self) -> Dict:
+        """Get current CPU core allocation status
+
+        :return: Dictionary with core allocation information
+        """
+        return self.core_allocator.get_core_allocation_status()
 
     def to_json(self) -> dict:
         """Return the JobManager Jobs as a Json dict"""
@@ -403,12 +596,35 @@ class Job:
         self.update_status = ""
         self.status = ""
 
+        # CPU core allocation
+        self.allocated_cores: Optional[List[int]] = None
+
         self.working_dir = Path(self.sq_job.input).parent.absolute()
 
         # If its the first start of job
         if not j_connect:
+            # Allocate cores BEFORE starting the process so we can use them in mpiexec command
+            # Use a temporary PID of 0 since we don't have the actual PID yet
+            # Only allocate cores if Intel MPI core allocation is enabled
+            if not self.job_manager.disable_intel_mpi_core_allocation:
+                self.allocated_cores = self.job_manager.core_allocator.allocate_cores(
+                    job_id=self.sq_job.id,
+                    pid=0,  # Temporary, will be updated after process starts
+                    num_cores=self.sq_job.ncpu
+                )
+
+            # Build the command with allocated cores (if core allocation is enabled)
+            command = self.sq_job.command
+            if (self.allocated_cores and
+                not self.job_manager.disable_intel_mpi_core_allocation and
+                    "mpiexec" in command):
+                command = command.replace(
+                    "mpiexec",
+                    f"mpiexec -genv I_MPI_PIN=1 -genv I_MPI_PIN_PROCESSOR_LIST={self.allocated_cores[0]}-{self.allocated_cores[-1]}"
+                )
+
             process = subprocess.Popen(
-                "cmd /c " + self.sq_job.command + "> stdout 2>&1",
+                "cmd /c " + command + " > stdout 2>&1",
                 cwd=self.working_dir,
                 creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB
                 | subprocess.CREATE_NO_WINDOW,
@@ -430,10 +646,21 @@ class Job:
             except psutil.NoSuchProcess:
                 print("noprocess")
 
+            # Update the allocated cores with the actual PID (only if core allocation is enabled)
+            if self.allocated_cores and not self.job_manager.disable_intel_mpi_core_allocation:
+                with self.job_manager.core_allocator.lock:
+                    for core in self.job_manager.core_allocator.cores:
+                        if core['job_id'] == self.sq_job.id and core['pid'] == 0:
+                            core['pid'] = pid_to_write
+
+            # Write PID and allocated cores to file
             with open(
                 os.path.join(self.working_dir, "pid"), "w", encoding="utf-8"
             ) as file:
-                file.write(str(pid_to_write))
+                file.write(f"{pid_to_write}\n")
+                if self.allocated_cores and not self.job_manager.disable_intel_mpi_core_allocation:
+                    file.write(json.dumps(
+                        {"cores": self.allocated_cores}) + "\n")
 
         self.watchdog = StdoutWatchdogThread(
             self, self.working_dir, j_connect=self.j_connect
@@ -469,6 +696,20 @@ class Job:
         if not self.watchdog.is_alive():
             self.watchdog.start()
 
+    def release_cores(self) -> None:
+        """Release allocated cores when job ends"""
+        if self.allocated_cores is not None:
+            self.job_manager.core_allocator.release_cores(self.sq_job.id)
+            self.allocated_cores = None
+            # Clear from database as well
+            with self.app.app_context():
+                try:
+                    query = SqlJob.query.filter_by(id=self.sq_job.id).one()
+                    query.allocated_cores = None
+                    db.session.commit()
+                except:
+                    pass
+
     def stop(self) -> None:
         """Stop the child watchdog Thread and try to delete itself from the parent JobManager"""
 
@@ -477,6 +718,16 @@ class Job:
             self.watchdog.join()
         except:
             pass
+
+        # Safety fallback: release cores if they haven't been released yet
+        # (cores should normally be released when job ends, not when removed from manager)
+        if self.allocated_cores is not None:
+            print(
+                Fore.YELLOW +
+                f"Warning: Cores still allocated at stop() for job {self.sq_job.id}, releasing as fallback" +
+                Style.RESET_ALL
+            )
+            self.release_cores()
 
         # self.job_manager.stop_job(self.sq_job.id)
 
@@ -567,14 +818,34 @@ class Job:
                         query.pid = j_json["pid"]
 
                     if "status" in j_json:
+                        old_status = self.status
                         self.status = j_json["status"]
                         query.status = j_json["status"]
+
+                        # Release cores when job reaches a terminal state
+                        terminal_states = ["Finished", "Error", "Stopped"]
+                        if self.status in terminal_states and old_status not in terminal_states:
+                            # Release cores outside of this context to avoid nested context issues
+                            # We'll do it after commit
+                            pass
 
                     if "started" in j_json:
                         query.started = j_json["started"]
 
+                    if "allocated_cores" in j_json:
+                        query.allocated_cores = j_json["allocated_cores"]
+
                 try:
                     db.session.commit()
+
+                    # Release cores after commit if status changed to terminal state
+                    if "status" in j_json:
+                        terminal_states = ["Finished",
+                                           "Error", "Stopped", "sw1"]
+                        if self.status in terminal_states and self.allocated_cores is not None:
+                            # Check if cores were just released by this status change
+                            # (avoid double-release if status updates multiple times)
+                            self.release_cores()
                 except:
                     pass
 
@@ -593,6 +864,7 @@ class Job:
         return json.dumps(
             {
                 "id": self.sq_job.id,
+                "allocated_cores": self.allocated_cores,
             },
             sort_keys=True,
             indent=4,
@@ -636,20 +908,90 @@ class StdoutWatchdogThread(Thread):
         ):
             time.sleep(0.1)
 
-        with open(os.path.join(self.working_dir, "pid"), "rb") as file:
-            try:
-                file.seek(-2, os.SEEK_END)
-                while file.read(1) != b"\n":
-                    file.seek(-2, os.SEEK_CUR)
-            except OSError:
-                file.seek(0)
-            last_line = file.readline().decode("utf-8")
-            self.job.sq_job.pid = int(last_line)
-            json_f = {"pid": int(last_line), "status": "Starting"}
+        # Read PID and potentially core allocation from pid file
+        with open(os.path.join(self.working_dir, "pid"), "r", encoding="utf-8") as file:
+            lines = file.readlines()
+
+            # First line is always the PID
+            pid_line = lines[0].strip()
+            self.job.sq_job.pid = int(pid_line)
+
+            # Only restore cores if this is a reconnection (j_connect=True)
+            # For new jobs, cores are already allocated in __init__
+            # Skip core allocation entirely if disabled
+            if self.j_connect and not self.job.job_manager.disable_intel_mpi_core_allocation:
+                # Try to restore cores from multiple sources (in order of priority)
+                restored_cores = None
+
+                # 1. Try from pid file (second line)
+                if len(lines) > 1:
+                    try:
+                        cores_data = json.loads(lines[1].strip())
+                        restored_cores = cores_data.get('cores', [])
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        pass
+
+                # 2. Fallback to database if pid file doesn't have cores
+                if not restored_cores and self.job.sq_job.allocated_cores:
+                    try:
+                        restored_cores = json.loads(
+                            self.job.sq_job.allocated_cores)
+                        print(
+                            Fore.YELLOW +
+                            f"Restoring cores from database for job {self.job.sq_job.id}" +
+                            Style.RESET_ALL
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+                # Try to allocate the same cores that were previously allocated
+                if restored_cores:
+                    allocated = self.job.job_manager.core_allocator.allocate_specific_cores(
+                        job_id=self.job.sq_job.id,
+                        pid=self.job.sq_job.pid,
+                        core_indices=restored_cores
+                    )
+                    if allocated:
+                        self.job.allocated_cores = allocated
+                        print(
+                            Fore.GREEN +
+                            f"Restored core allocation {allocated[0]}-{allocated[-1]} for job {self.job.sq_job.id}" +
+                            Style.RESET_ALL
+                        )
+                    else:
+                        # Fallback: allocate any available cores
+                        self.job.allocated_cores = self.job.job_manager.core_allocator.allocate_cores(
+                            job_id=self.job.sq_job.id,
+                            pid=self.job.sq_job.pid,
+                            num_cores=self.job.sq_job.ncpu
+                        )
+                else:
+                    # No saved core data - allocate new cores
+                    self.job.allocated_cores = self.job.job_manager.core_allocator.allocate_cores(
+                        job_id=self.job.sq_job.id,
+                        pid=self.job.sq_job.pid,
+                        num_cores=self.job.sq_job.ncpu
+                    )
+
+            json_f = {"pid": int(pid_line), "status": "Starting"}
             if not self.j_connect:
                 self.job.sq_job.started = int(time.time())
                 json_f["started"] = int(time.time())
             self.job.update_db(json_f)
+
+        # Write allocated cores back to pid file and database for future restarts
+        # (For new jobs, this is redundant but ensures consistency)
+        # Only write cores if core allocation is enabled
+        if (self.job.allocated_cores is not None and
+                not self.job.job_manager.disable_intel_mpi_core_allocation):
+            with open(os.path.join(self.working_dir, "pid"), "w", encoding="utf-8") as file:
+                file.write(f"{self.job.sq_job.pid}\n")
+                file.write(json.dumps(
+                    {"cores": self.job.allocated_cores}) + "\n")
+
+            # Save to database as well
+            self.job.update_db(
+                {"allocated_cores": json.dumps(self.job.allocated_cores)})
 
         # ------------------------------------------------------------------------------
         #                          File reader loop

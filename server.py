@@ -8,7 +8,7 @@ from engineio.async_drivers import gevent
 from os import system
 import argparse
 
-VERSION = "2.0.6"
+VERSION = "2.0.8"
 
 
 ART = f"""
@@ -43,12 +43,28 @@ parser = argparse.ArgumentParser(description='')
 # Optional positional argument
 parser.add_argument('--port', type=int, default=5568,
                     help='server port to use')
+parser.add_argument('--noIntelMpiCoreAllocation', action='store_true',
+                    help='disable Intel MPI core allocation and pinning logic (jobs will run without CPU affinity)')
 ARGS = parser.parse_args()
 
 
 socketio.init_app(app, cors_allowed_origins='*',
                   async_mode='gevent', logger=False)
+
+# Configure job_manager with command line options
+job_manager.configure(
+    disable_intel_mpi_core_allocation=ARGS.noIntelMpiCoreAllocation)
+
 job_manager.set_context(app)
+
+# Display core allocation status
+if ARGS.noIntelMpiCoreAllocation:
+    print()
+    print(Fore.YELLOW + "═══ CORE ALLOCATION DISABLED ═══" + Style.RESET_ALL)
+    print(Fore.YELLOW + "Intel MPI core pinning is disabled" + Style.RESET_ALL)
+    print(Fore.YELLOW + "Jobs will run without CPU affinity constraints" + Style.RESET_ALL)
+    print(Fore.YELLOW + "═══════════════════════════════════" + Style.RESET_ALL)
+    print()
 
 
 if __name__ == '__main__':

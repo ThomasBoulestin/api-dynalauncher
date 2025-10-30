@@ -25,6 +25,8 @@ class SqlJob(db.Model):
     a_mass = db.Column(db.Float, unique=False, nullable=True)
     pct_mass = db.Column(db.Float, unique=False, nullable=True)
     sender = db.Column(db.String(300), unique=False, nullable=True)
+    # JSON string of core indices
+    allocated_cores = db.Column(db.String(500), unique=False, nullable=True)
 
     def __repr__(self):
         return f"<SqlJob {self.id}>"
@@ -46,7 +48,7 @@ def ensure_schema() -> None:
     """Ensure DB schema is up-to-date for existing databases.
 
     - Adds missing columns that were introduced after initial table creation.
-    Currently handled: `sender` column on `SqlJob`.
+    Currently handled: `sender` column and `allocated_cores` column on `SqlJob`.
     """
     # Accessing db.engine requires an app context; caller must ensure it.
     from sqlalchemy import text
@@ -63,6 +65,11 @@ def ensure_schema() -> None:
             # Add the new column as nullable VARCHAR(300)
             conn.execute(
                 text(f'ALTER TABLE "{table_name}" ADD COLUMN sender VARCHAR(300)'))
+
+        if "allocated_cores" not in existing_cols:
+            # Add the new column as nullable VARCHAR(500) to store JSON array
+            conn.execute(
+                text(f'ALTER TABLE "{table_name}" ADD COLUMN allocated_cores VARCHAR(500)'))
 
 
 if __name__ == "__main__":

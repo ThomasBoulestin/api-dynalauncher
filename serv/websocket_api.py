@@ -41,6 +41,8 @@ def sqlJobRequestToList(sql_job_list) -> List[dict]:
         "a_mass": j.a_mass,
         "pct_mass": j.pct_mass,
         "sender": j.sender if hasattr(j, 'sender') else None,
+        "allocated_cores": j.allocated_cores if hasattr(j, 'allocated_cores') else None,
+
     } for j in sql_job_list]
 
 
@@ -290,6 +292,7 @@ def getRunningShells():
             "a_mass": job.sq_job.a_mass,
             "pct_mass": job.sq_job.pct_mass,
             "sender": job.sq_job.sender if hasattr(job.sq_job, 'sender') else None,
+            "allocated_cores": job.sq_job.allocated_cores if hasattr(job.sq_job, 'allocated_cores') else None,
             "stdout": ''.join(job.get_shell_content())
         })
 
