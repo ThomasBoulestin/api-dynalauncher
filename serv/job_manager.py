@@ -18,6 +18,9 @@ from colorama import Fore, Back, Style, init
 from typing import List, Dict
 import sys
 
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -195,21 +198,17 @@ def resource_path(relative_path):
 
 def get_lic_count(server='') -> List[int]:
     """Return LsDyna license server informations using lstc_qrun.exe
-    :param server: Name or IP of the lic server. If "", LSTC_LICENSE_SERVER
-                           env variable is used
 
-    return (used, max) as integers
+    :param server: Name or IP of the lic server. If "", LSTC_LICENSE_SERVER
+                   env variable is used
+    :return: [used, max] as integers, or [-2, 0] on error
     """
 
     exe = resource_path(r"dyna-tools/lstc_qrun.exe")
     command = [exe, "-r"]
 
-    if server != "":
-        command.append("-s")
-        command.append(server)
-
-    used = -1
-    max_ = 0
+    if server:
+        command.extend(["-s", server])
 
     try:
         process = subprocess.run(
@@ -217,29 +216,46 @@ def get_lic_count(server='') -> List[int]:
         )
         stdout_as_str = process.stdout.decode("utf-8")
         stdout_split = stdout_as_str.split()
+
+        # Validate output has expected format (at least 5 tokens)
+        if len(stdout_split) < 5:
+            print(
+                f"ERROR: Unexpected lstc_qrun output format (got {len(stdout_split)} tokens) for server '{server or 'default'}'")
+            return [-2, 0]
+
+        # Parse: output format has max at position -3 and used at -5
         max_ = int(stdout_split[-3])
         used = int(stdout_split[-5])
-    except Exception as e:
-        print(e)
-        return [-2, 0]
 
-    return [used, max_]
+        return [used, max_]
+
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(
+            f"ERROR: Failed to execute lstc_qrun for server '{server or 'default'}': {e}")
+        return [-2, 0]
+    except (ValueError, IndexError) as e:
+        print(
+            f"ERROR: Failed to parse lstc_qrun output for server '{server or 'default'}': {e}")
+        return [-2, 0]
+    except UnicodeDecodeError as e:
+        print(
+            f"ERROR: Failed to decode lstc_qrun output for server '{server or 'default'}': {e}")
+        return [-2, 0]
 
 
 def get_qrun_jobs(server="") -> List[Dict]:
     """Return LsDyna license server running jobs informations using lstc_qrun.exe
+
     :param server: Name or IP of the lic server. If "", LSTC_LICENSE_SERVER
-                           env variable is used
+                   env variable is used
+    :return: List of job dictionaries, or [] on error
     """
 
     exe = resource_path(r"dyna-tools/lstc_qrun")
     command = [exe]
 
-    out_list = []
-
-    if server != "":
-        command.append("-s")
-        command.append(server)
+    if server:
+        command.extend(["-s", server])
 
     try:
         process = subprocess.run(
@@ -247,47 +263,67 @@ def get_qrun_jobs(server="") -> List[Dict]:
         )
         stdout_as_str = process.stdout.decode("utf-8")
 
+        out_list = []
         read = False
+
         for line in stdout_as_str.splitlines():
             if "----------------" in line:
                 read = True
                 continue
 
-            if len(line.split()) < 5:
+            tokens = line.split()
+            if len(tokens) < 5:
                 read = False
                 continue
 
             if read:
-                l = line.split()
-                out_list.append(
-                    {
-                        "user": l[0],
-                        "host": l[1],
-                        "program": l[2],
-                        "started": " ".join([l[3], l[4], l[5], l[6]]),
-                        "procs":  l[7],
-                        "josbs":  l[8]
-                    }
-                )
+                try:
+                    # Validate we have enough tokens (need at least 9: user, host, program, 4 date/time, procs, jobs)
+                    if len(tokens) >= 9:
+                        out_list.append(
+                            {
+                                "user": tokens[0],
+                                "host": tokens[1],
+                                "program": tokens[2],
+                                "started": " ".join([tokens[3], tokens[4], tokens[5], tokens[6]]),
+                                "procs": tokens[7],
+                                "josbs": tokens[8]
+                            }
+                        )
+                    else:
+                        print(
+                            f"Warning: Skipping line with insufficient tokens ({len(tokens)}): {line.strip()}")
+                except (IndexError, ValueError) as e:
+                    print(
+                        f"Warning: Failed to parse qrun job line: {line.strip()} - {e}")
+                    continue
 
-    except:
+        return out_list
+
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(
+            f"ERROR: Failed to execute lstc_qrun for server '{server or 'default'}': {e}")
         return []
-
-    return out_list
+    except UnicodeDecodeError as e:
+        print(
+            f"ERROR: Failed to decode lstc_qrun output for server '{server or 'default'}': {e}")
+        return []
 
 
 def qkill_job(host, server="") -> [bool, str]:
-    """Return LsDyna license server running jobs informations using lstc_qrun.exe
+    """Terminate a job on the LsDyna license server using lstc_qkill
+
+    :param host: Host identifier for the job to kill
     :param server: Name or IP of the lic server. If "", LSTC_LICENSE_SERVER
-                           env variable is used
+                   env variable is used
+    :return: Tuple of (success: bool, message: str)
     """
 
     exe = resource_path(r"dyna-tools/lstc_qkill")
     command = [exe, host]
 
-    if server != "":
-        command.append("-s")
-        command.append(server)
+    if server:
+        command.extend(["-s", server])
 
     try:
         process = subprocess.run(
@@ -295,22 +331,32 @@ def qkill_job(host, server="") -> [bool, str]:
         )
         stdout_as_str = process.stdout.decode("utf-8")
 
-        if "procid@machine" in stdout_as_str:
-            return False, stdout_as_str
-
-        if "License server cannot find" in stdout_as_str:
-            return False, stdout_as_str
-
-        if "You are not authorized to terminate this job" in stdout_as_str:
-            return False, stdout_as_str
-
+        # Check for success
         if "Program queued for termination" in stdout_as_str:
             return True, stdout_as_str
 
-    except:
-        return False, "unknown error"
+        # Check for specific error conditions
+        error_messages = [
+            "procid@machine",
+            "License server cannot find",
+            "You are not authorized to terminate this job"
+        ]
 
-    return False, "unknown error"
+        for error in error_messages:
+            if error in stdout_as_str:
+                return False, stdout_as_str
+
+        # Unknown response format
+        return False, f"Unexpected lstc_qkill response: {stdout_as_str}"
+
+    except (subprocess.TimeoutExpired, OSError) as e:
+        error_msg = f"Failed to execute lstc_qkill for host '{host}' on server '{server or 'default'}': {e}"
+        print(f"ERROR: {error_msg}")
+        return False, error_msg
+    except UnicodeDecodeError as e:
+        error_msg = f"Failed to decode lstc_qkill output: {e}"
+        print(f"ERROR: {error_msg}")
+        return False, error_msg
 
 
 class JobManager:
@@ -388,11 +434,11 @@ class JobManager:
                     j.status = "Stopped"
                     db.session.commit()
 
-        # # configure a watchdog thread
-        # watchdog = Thread(
-        #     target=job_watchdog_task, name="job_watchdog_task", args=[self], daemon=True
-        # )
-        # watchdog.start()
+        # Configure a watchdog thread to monitor dead processes
+        watchdog = Thread(
+            target=job_watchdog_task, name="job_watchdog_task", args=[self], daemon=True
+        )
+        watchdog.start()
 
         # elapsed_updater = Thread(
         #     target=elapsed_updater_task,
@@ -630,21 +676,60 @@ class Job:
                 | subprocess.CREATE_NO_WINDOW,
             )
 
-            sleep(1)
-
+            # Wait and find the actual LS-DYNA process PID (not cmd.exe or mpiexec)
             pid_to_write = process.pid
+            dyna_process_found = False
 
-            try:
-                parent = psutil.Process(process.pid)
-                children = parent.children(recursive=True)
-                for p in children:
-                    # print(p.pid, len(p.children(recursive=True)))
-                    if len(p.children(recursive=True)) == 2:
-                        # print("    " + str(p.pid))
-                        pid_to_write = p.pid
+            # Retry logic: wait up to 10 seconds for LS-DYNA process to start
+            for attempt in range(20):  # 20 attempts x 0.5s = 10 seconds max
+                sleep(0.5)
+                try:
+                    parent = psutil.Process(process.pid)
+                    children = parent.children(recursive=True)
 
-            except psutil.NoSuchProcess:
-                print("noprocess")
+                    # Search for LS-DYNA process by name pattern
+                    for p in children:
+                        try:
+                            proc_name = p.name().lower()
+                            # Look for common LS-DYNA executable names
+                            if any(name in proc_name for name in ['ls-dyna', 'lsdyna', 'dyna', 'mpp']):
+                                pid_to_write = p.pid
+                                dyna_process_found = True
+                                print(
+                                    Fore.GREEN +
+                                    f"Found LS-DYNA process: {proc_name} (PID: {pid_to_write})" +
+                                    Style.RESET_ALL
+                                )
+                                break
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+
+                    if dyna_process_found:
+                        break
+
+                except psutil.NoSuchProcess:
+                    print(
+                        Fore.YELLOW +
+                        f"Warning: Parent process died during startup (attempt {attempt+1}/20)" +
+                        Style.RESET_ALL
+                    )
+                    break
+
+            if not dyna_process_found:
+                print(
+                    Fore.RED +
+                    f"ERROR: Could not find LS-DYNA process for job {self.sq_job.id}. " +
+                    f"Using fallback PID: {pid_to_write}" +
+                    Style.RESET_ALL
+                )
+                # Log all children for debugging
+                try:
+                    parent = psutil.Process(process.pid)
+                    children = parent.children(recursive=True)
+                    print(
+                        f"Available child processes: {[(p.pid, p.name()) for p in children]}")
+                except:
+                    pass
 
             # Update the allocated cores with the actual PID (only if core allocation is enabled)
             if self.allocated_cores and not self.job_manager.disable_intel_mpi_core_allocation:
@@ -846,8 +931,12 @@ class Job:
                             # Check if cores were just released by this status change
                             # (avoid double-release if status updates multiple times)
                             self.release_cores()
-                except:
-                    pass
+                except Exception as e:
+                    print(
+                        Fore.RED +
+                        f"ERROR: Failed to commit database for job {self.sq_job.id}: {e}" +
+                        Style.RESET_ALL
+                    )
 
             self.socketio.emit("message", json.dumps({"jsonrpc": "2.0", "method": "update_data",
                                                       "params": {"id": self.sq_job.id, "payload": j_json}}), broadcast=True
@@ -871,8 +960,26 @@ class Job:
         )
 
 
+class StdoutFileHandler(FileSystemEventHandler):
+    """Handler pour surveiller les modifications du fichier stdout"""
+
+    def __init__(self, watchdog_thread):
+        self.watchdog_thread = watchdog_thread
+        self.last_modified = time.time()
+
+    def on_modified(self, event):
+        if event.src_path.endswith('stdout') or 'stdout' in event.src_path:
+            # Debounce: éviter les notifications multiples rapides
+            now = time.time()
+            if now - self.last_modified > 0.1:  # 100ms debounce
+                self.last_modified = now
+                self.watchdog_thread.trigger_read()
+
+
 class StdoutWatchdogThread(Thread):
     """Watchdog to read stdout file content and communicate infos to parent Job object
+
+    Uses watchdog library to monitor file changes instead of polling.
 
     :param job: parent Job to communicate with.
     :param wd: Job working directory.
@@ -889,11 +996,27 @@ class StdoutWatchdogThread(Thread):
         self.j_connect = j_connect
 
         self.exit = Event()
+        self.read_event = Event()  # Event déclenché par watchdog
+
+        # Initialiser le file watcher
+        self.file_handler = StdoutFileHandler(self)
+        self.observer = Observer()
+        self.observer.schedule(self.file_handler, wd, recursive=False)
+
+    def trigger_read(self):
+        """Déclenché quand le fichier stdout est modifié"""
+        self.read_event.set()
 
     def stop(self) -> None:
-        """Stop the Thread loop"""
-        self.exit.set()
+        """Stop the Thread loop and file observer"""
         self.running = False
+        try:
+            self.observer.stop()
+            self.observer.join(timeout=2)
+        except:
+            pass
+        self.exit.set()
+        self.read_event.set()  # Débloquer si en attente
 
     def run(self) -> None:
         """Start the reading loop"""
@@ -994,14 +1117,26 @@ class StdoutWatchdogThread(Thread):
                 {"allocated_cores": json.dumps(self.job.allocated_cores)})
 
         # ------------------------------------------------------------------------------
-        #                          File reader loop
+        #                          File reader loop with watchdog
         # ------------------------------------------------------------------------------
+
+        # Démarrer l'observer après avoir récupéré le PID
+        try:
+            self.observer.start()
+            print(
+                Fore.CYAN +
+                f"File watcher started for job {self.job.sq_job.id}" +
+                Style.RESET_ALL
+            )
+        except Exception as e:
+            print(
+                Fore.YELLOW +
+                f"Warning: Could not start file watcher for job {self.job.sq_job.id}: {e}" +
+                Style.RESET_ALL
+            )
 
         # Actual byte position of the reader
         pos = 0
-
-        # Sleep time between loops
-        sleep_time = 1
 
         # current job time to increment and compare
         actual_time = 0
@@ -1015,41 +1150,53 @@ class StdoutWatchdogThread(Thread):
 
             pos, actual_time, to_add, json_f = self.readFile(pos, actual_time)
 
-            self.job.update_db(json_f)
-            self.job.update_shell(to_add)
-            self.exit.wait(sleep_time)
+            # Mise à jour seulement si changements
+            if to_add or json_f:
+                self.job.update_db(json_f)
+                self.job.update_shell(to_add)
+
+            # Attendre notification du watchdog OU timeout de 5s (sécurité)
+            # Si le fichier est modifié, read_event est déclenché immédiatement
+            # Sinon, timeout après 5s pour vérifier quand même
+            self.read_event.wait(timeout=5)
+            self.read_event.clear()
 
             if not psutil.pid_exists(self.job.sq_job.pid):
                 break
 
+        # Lecture finale après sortie de boucle
         pos, actual_time, to_add, json_f = self.readFile(pos, actual_time)
 
-        self.job.update_db(json_f)
-        self.job.update_shell(to_add)
-
-        self.exit.wait(sleep_time)
+        if to_add or json_f:
+            self.job.update_db(json_f)
+            self.job.update_shell(to_add)
 
         # self.job.stop()
 
     def readFile(self, pos, actual_time):
+        """Read and parse stdout file content
+
+        Optimized version that accumulates all changes and performs a single DB update.
+        """
         with open(os.path.join(self.working_dir, "stdout"), "rb") as file:
-            json_f = {}
             file.seek(pos)
             to_add = deque()
 
-            while line_coded := file.readline():
-                json_f = {}
+            # Accumulate ALL changes here - single DB transaction at the end
+            updates = {}
+            new_actual_time = actual_time
 
+            while line_coded := file.readline():
                 if line_coded == b"\x00":
                     pos = file.tell()
                     continue
 
+                # Decode with fallback to UTF-16LE
                 try:
                     line = line_coded.decode("utf-8").replace("\n", "")
-                except ValueError:
-                    line = line_coded.decode("utf-16le", errors="ignore").replace(
-                        "\n", ""
-                    )
+                except (UnicodeDecodeError, ValueError):
+                    line = line_coded.decode(
+                        "utf-16le", errors="ignore").replace("\n", "")
 
                 if len(line) > 0:
                     line += "\n"
@@ -1057,82 +1204,76 @@ class StdoutWatchdogThread(Thread):
 
                 pos = file.tell()
 
-                if (
-                    "Livermore  Software  Technology  Corporation" in line
-                    and self.job.sq_job.status != "Running"
-                ):
-                    json_f["status"] = "Running"
-                    self.job.update_db(json_f)
+                # === Status detection ===
+                if "Livermore  Software  Technology  Corporation" in line:
+                    if self.job.sq_job.status != "Running":
+                        updates["status"] = "Running"
 
-                if (
-                    "added mass          =" in line
-                    and self.job.sq_job.a_mass is None
-                ):
-                    a_mass = float(line.split()[-1])
-                    self.job.sq_job.a_mass = float(a_mass)
-                    json_f["a_mass"] = float(a_mass)
-                    self.job.update_db(json_f)
+                # === Mass metrics ===
+                if "added mass          =" in line and self.job.sq_job.a_mass is None:
+                    try:
+                        a_mass = float(line.split()[-1])
+                        self.job.sq_job.a_mass = a_mass
+                        updates["a_mass"] = a_mass
+                    except (IndexError, ValueError) as e:
+                        print(
+                            f"Warning: Could not parse added mass from line: {line.strip()}")
 
-                if (
-                    "percentage increase =" in line
-                    and self.job.sq_job.pct_mass is None
-                ):
-                    pct_mass = float(line.split()[-1])
-                    self.job.sq_job.pct_mass = float(pct_mass)
-                    json_f["pct_mass"] = float(pct_mass)
-                    self.job.update_db(json_f)
+                if "percentage increase =" in line and self.job.sq_job.pct_mass is None:
+                    try:
+                        pct_mass = float(line.split()[-1])
+                        self.job.sq_job.pct_mass = pct_mass
+                        updates["pct_mass"] = pct_mass
+                    except (IndexError, ValueError):
+                        print(
+                            f"Warning: Could not parse pct_mass from line: {line.strip()}")
 
+                # === Termination time ===
                 if "termination time" in line and self.job.sq_job.end is None:
                     try:
                         e_time = float(line.split()[-1])
-                        self.job.sq_job.end = float(e_time)
-                        json_f["end"] = float(e_time)
-                        self.job.update_db(json_f)
-                    except ValueError:
+                        self.job.sq_job.end = e_time
+                        updates["end"] = e_time
+                    except (IndexError, ValueError):
                         pass
 
+                # === Current time / Progress ===
                 if "write d3plot file" in line or "flush i/o buffers" in line:
-                    c_time = line.split()[2]
-                    if float(c_time) > actual_time:
-                        self.job.sq_job.current = float(c_time)
-                        json_f["current"] = float(c_time)
-                        self.job.update_db(json_f)
-                        actual_time = float(c_time)
+                    try:
+                        c_time = float(line.split()[2])
+                        if c_time > new_actual_time:
+                            self.job.sq_job.current = c_time
+                            updates["current"] = c_time
+                            new_actual_time = c_time
+                    except (IndexError, ValueError):
+                        pass
 
                 if "failed at time" in line:
-                    c_time = line.split()[-1]
-                    if float(c_time) > actual_time:
-                        self.job.sq_job.current = float(c_time)
-                        json_f["current"] = float(c_time)
-                        self.job.update_db(json_f)
-                        actual_time = float(c_time)
+                    try:
+                        c_time = float(line.split()[-1])
+                        if c_time > new_actual_time:
+                            self.job.sq_job.current = c_time
+                            updates["current"] = c_time
+                            new_actual_time = c_time
+                    except (IndexError, ValueError):
+                        pass
 
-                if "error analysis" in line:
-                    json_f["status"] = "Error"
-                    self.job.update_db(json_f)
+                # === Error detection (factorized) ===
+                error_patterns = ["error analysis", "E r r o r",
+                                  "BAD TERMINATION", "Segmentation Violation"]
+                if any(pattern in line for pattern in error_patterns):
+                    updates["status"] = "Error"
 
-                if "E r r o r" in line:
-                    json_f["status"] = "Error"
-                    self.job.update_db(json_f)
-
-                if "BAD TERMINATION" in line:
-                    json_f["status"] = "Error"
-                    self.job.update_db(json_f)
-
-                if "Segmentation Violation" in line:
-                    json_f["status"] = "Error"
-                    self.job.update_db(json_f)
-
+                # === Normal termination ===
                 if "N o r m a l" in line and self.job.status not in ["sw1"]:
-                    if self.job.update_status != "":
-                        json_f["status"] = self.job.update_status
+                    if self.job.update_status:
+                        updates["status"] = self.job.update_status
                     else:
-                        json_f["status"] = "Finished"
-                        json_f["current"] = self.job.sq_job.end
+                        updates["status"] = "Finished"
+                        if self.job.sq_job.end:
+                            updates["current"] = self.job.sq_job.end
 
-                    self.job.update_db(json_f)
-
-        return pos, actual_time, to_add, json_f
+        return pos, new_actual_time, to_add, updates
 
 
 class QueueManager:

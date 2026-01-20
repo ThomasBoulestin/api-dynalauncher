@@ -310,3 +310,13 @@ def removeShell(id):
                       )
 
     return Success(id)
+
+
+@method
+def getCoreAllocationStatus():
+    """Get current CPU core allocation status"""
+    try:
+        status = job_manager.get_core_allocation_status()
+        return Success(status)
+    except Exception as e:
+        return Error(40, f"Failed to get core allocation status: {str(e)}")
