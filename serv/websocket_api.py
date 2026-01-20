@@ -14,7 +14,14 @@ from jsonrpcserver import method, Result, Success, dispatch, Error
 
 
 socketio = SocketIO()
+
+# Initialize JobManager with core limit
+# For a system with 56 cores but only 40 usable (e.g., due to licensing):
+# job_manager = JobManager(socketio, max_usable_cores=40)
+#
+# For normal operation (use all detected cores):
 job_manager = JobManager(socketio)
+# Or explicitly: job_manager = JobManager(socketio, max_usable_cores=None)
 
 
 def sqlJobRequestToList(sql_job_list) -> List[dict]:

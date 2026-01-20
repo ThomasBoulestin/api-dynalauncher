@@ -40,30 +40,98 @@ class CoreAllocator:
     and allocates cores to jobs to prevent over-subscription.
     """
 
-    def __init__(self) -> None:
-        """Initialize core allocator with system CPU information"""
+    def __init__(self, max_usable_cores: Optional[int] = None) -> None:
+        """Initialize core allocator with system CPU information
+
+        :param max_usable_cores: Maximum number of cores that can be used (e.g., 40 out of 56).
+                                 If None, all detected cores are usable.
+        """
         self.physical_cores = psutil.cpu_count(logical=False)
         self.logical_cores = psutil.cpu_count(logical=True)
         self.hyper_threading_enabled = self.logical_cores > self.physical_cores
 
-        # List of core dictionaries: {'index': int, 'job_id': Optional[int], 'pid': Optional[int]}
-        self.cores = [
-            {'index': i, 'job_id': None, 'pid': None}
-            for i in range(self.logical_cores)
-        ]
+        # Apply core usage limit if specified
+        self.max_usable_cores = max_usable_cores if max_usable_cores else self.logical_cores
+        if self.max_usable_cores > self.logical_cores:
+            print(
+                Fore.YELLOW +
+                f"Warning: max_usable_cores ({self.max_usable_cores}) exceeds detected cores ({self.logical_cores}). Using {self.logical_cores}." +
+                Style.RESET_ALL
+            )
+            self.max_usable_cores = self.logical_cores
+
+        # Detect NUMA topology for multi-socket systems
+        try:
+            # Get CPU affinity to detect NUMA nodes
+            # On Windows, cores are typically numbered: socket0_cores, socket1_cores, ...
+            # For a 2-socket system with 16 cores each: 0-15 (socket0), 16-31 (socket1)
+            self.cores_per_socket = self.physical_cores // max(
+                1, len(psutil.cpu_count(logical=False) and [1] or []))
+
+            # Detect number of physical processors/sockets
+            # Heuristic: if we have many cores, likely multi-socket
+            # Common configs: single socket (4-16 cores), dual socket (2x8-32 cores)
+            if self.physical_cores >= 16:
+                # Likely dual socket - assume cores split evenly
+                self.num_sockets = 2
+                self.cores_per_socket = self.physical_cores // 2
+            else:
+                # Single socket system
+                self.num_sockets = 1
+                self.cores_per_socket = self.physical_cores
+
+        except:
+            # Fallback: assume single socket
+            self.num_sockets = 1
+            self.cores_per_socket = self.physical_cores
+
+        # List of core dictionaries: {'index': int, 'job_id': Optional[int], 'pid': Optional[int], 'socket': int, 'usable': bool}
+        self.cores = []
+        for i in range(self.logical_cores):
+            # Determine which socket this core belongs to
+            if self.hyper_threading_enabled:
+                # With HT: first half are physical cores, second half are HT siblings
+                physical_core_index = i if i < self.physical_cores else i - self.physical_cores
+                socket = physical_core_index // self.cores_per_socket
+            else:
+                # Without HT: cores are numbered sequentially per socket
+                socket = i // self.cores_per_socket
+
+            # Mark core as usable only if within the allowed range
+            usable = i < self.max_usable_cores
+
+            self.cores.append({
+                'index': i,
+                'job_id': None,
+                'pid': None,
+                'socket': socket,
+                'usable': usable
+            })
 
         # Lock for thread-safe core allocation
         self.lock = Lock()
+
+        # Round-robin allocation tracking to ensure all cores get used evenly
+        # On single-socket systems, this prevents last cores from being underutilized
+        self.next_allocation_start = 0
+
+        restricted_count = self.logical_cores - self.max_usable_cores
+        restriction_info = f"\n  ⚠️  Restricted cores: {restricted_count} (cores {self.max_usable_cores}-{self.logical_cores-1} unavailable)" if restricted_count > 0 else ""
 
         print(
             Fore.GREEN + "CPU Information:" + Style.RESET_ALL +
             f"\n  Physical cores: {self.physical_cores}" +
             f"\n  Logical cores: {self.logical_cores}" +
+            f"\n  Usable cores: {self.max_usable_cores}" +
+            restriction_info +
+            f"\n  Sockets detected: {self.num_sockets}" +
+            f"\n  Cores per socket: {self.cores_per_socket}" +
             f"\n  Hyper-threading: {'Enabled' if self.hyper_threading_enabled else 'Disabled'}"
         )
 
     def allocate_cores(self, job_id: int, pid: int, num_cores: int) -> Optional[List[int]]:
-        """Allocate cores for a job
+        """Allocate cores for a job, distributed across sockets for better memory bandwidth
+        Uses round-robin allocation on single-socket systems to ensure all cores get equal usage
 
         :param job_id: Job ID requesting cores
         :param pid: Process ID of the job
@@ -74,30 +142,106 @@ class CoreAllocator:
             # If hyper-threading is enabled, allocate 2x the cores
             cores_to_allocate = num_cores * 2 if self.hyper_threading_enabled else num_cores
 
-            # Find available cores
-            available_cores = [
-                core for core in self.cores if core['job_id'] is None]
+            # Find available cores grouped by socket (only consider usable cores)
+            available_by_socket = {}
+            for core in self.cores:
+                if core['job_id'] is None and core['usable']:
+                    socket = core['socket']
+                    if socket not in available_by_socket:
+                        available_by_socket[socket] = []
+                    available_by_socket[socket].append(core)
 
-            if len(available_cores) < cores_to_allocate:
+            # Count total available
+            total_available = sum(len(cores)
+                                  for cores in available_by_socket.values())
+
+            if total_available < cores_to_allocate:
                 print(
                     Fore.YELLOW +
-                    f"Warning: Not enough cores available. Requested: {num_cores} ({'HT: ' + str(cores_to_allocate) if self.hyper_threading_enabled else cores_to_allocate}), Available: {len(available_cores)}" +
+                    f"Warning: Not enough cores available. Requested: {num_cores} ({'HT: ' + str(cores_to_allocate) if self.hyper_threading_enabled else cores_to_allocate}), Available: {total_available}" +
                     Style.RESET_ALL
                 )
                 return None
 
-            # Allocate the requested number of cores
+            # Strategy depends on number of sockets
             allocated_indices = []
-            for i in range(cores_to_allocate):
-                core = available_cores[i]
-                core['job_id'] = job_id
-                core['pid'] = pid
-                allocated_indices.append(core['index'])
+
+            if len(available_by_socket) > 1:
+                # Multi-socket: Distribute cores evenly across sockets for better memory bandwidth
+                # Also use round-robin within each socket to ensure all cores get used
+                cores_per_socket_target = cores_to_allocate // len(
+                    available_by_socket)
+                remainder = cores_to_allocate % len(available_by_socket)
+
+                # Track which cores were allocated across all sockets
+                socket_allocations = {}
+
+                for socket_id in sorted(available_by_socket.keys()):
+                    socket_cores = available_by_socket[socket_id]
+                    to_allocate_here = cores_per_socket_target + \
+                        (1 if remainder > 0 else 0)
+                    if remainder > 0:
+                        remainder -= 1
+
+                    # Round-robin within this socket to rotate through all cores
+                    # Use socket-specific offset based on total allocations
+                    socket_offset = self.next_allocation_start % len(
+                        socket_cores) if socket_cores else 0
+
+                    for i in range(min(to_allocate_here, len(socket_cores))):
+                        core = socket_cores[(socket_offset + i) %
+                                            len(socket_cores)]
+                        core['job_id'] = job_id
+                        core['pid'] = pid
+                        allocated_indices.append(core['index'])
+
+                    if len(allocated_indices) >= cores_to_allocate:
+                        break
+
+                # Update round-robin counter for next allocation
+                self.next_allocation_start = (
+                    self.next_allocation_start + cores_to_allocate) % max(1, len(self.cores))
+            else:
+                # Single socket: Use round-robin allocation to distribute wear evenly
+                # This ensures all cores get used over time, not just the first ones
+                all_available = []
+                for socket_cores in available_by_socket.values():
+                    all_available.extend(socket_cores)
+
+                # Sort by index for predictable behavior
+                all_available.sort(key=lambda c: c['index'])
+
+                # Find starting position using round-robin
+                # Rotate through available cores starting from last allocation point
+                start_idx = self.next_allocation_start % len(all_available)
+
+                # Allocate cores starting from the round-robin position
+                for i in range(cores_to_allocate):
+                    core = all_available[(start_idx + i) % len(all_available)]
+                    core['job_id'] = job_id
+                    core['pid'] = pid
+                    allocated_indices.append(core['index'])
+
+                # Update next start position for next allocation
+                self.next_allocation_start = (
+                    start_idx + cores_to_allocate) % len(all_available)
+
+            # Sort indices for cleaner output and PIN_PROCESSOR_LIST formatting
+            allocated_indices.sort()
 
             ht_info = f" (HT: {num_cores} physical = {cores_to_allocate} logical)" if self.hyper_threading_enabled else ""
+            socket_dist = {}
+            for idx in allocated_indices:
+                sock = next(c['socket']
+                            for c in self.cores if c['index'] == idx)
+                socket_dist[sock] = socket_dist.get(sock, 0) + 1
+
+            dist_info = f", distributed: {dict(socket_dist)}" if len(
+                socket_dist) > 1 else ""
+
             print(
                 Fore.CYAN +
-                f"Allocated cores {allocated_indices[0]}-{allocated_indices[-1]} to job {job_id} (PID: {pid}){ht_info}" +
+                f"Allocated cores {allocated_indices} to job {job_id} (PID: {pid}){ht_info}{dist_info}" +
                 Style.RESET_ALL
             )
 
@@ -366,7 +510,13 @@ class JobManager:
     :param SocketIO socketio: global socketio to communicate with the ws API.
     """
 
-    def __init__(self, socketio: SocketIO) -> None:
+    def __init__(self, socketio: SocketIO, max_usable_cores: Optional[int] = None) -> None:
+        """Initialize JobManager
+
+        :param socketio: SocketIO instance for communication
+        :param max_usable_cores: Maximum number of cores that can be allocated (e.g., 40 out of 56 total).
+                                 If None, all detected cores are usable.
+        """
         self.socketio = socketio
         self.jobs = {}
         self.app = None
@@ -374,8 +524,8 @@ class JobManager:
         # Configuration options
         self.disable_intel_mpi_core_allocation = False
 
-        # Initialize core allocator
-        self.core_allocator = CoreAllocator()
+        # Initialize core allocator with optional core limit
+        self.core_allocator = CoreAllocator(max_usable_cores=max_usable_cores)
 
         self.queue_manager = QueueManager(socketio, self)
 
@@ -471,13 +621,28 @@ class JobManager:
             memory=j_json["memory"],
             sender=j_json["sender"],
         )
+        j.status = "Starting"  # Set initial status immediately
 
         with self.app.app_context():
             db.session.add(j)
             db.session.commit()
+            j_json["id"] = j.id
+            j_json["status"] = "Starting"  # Add status to returned JSON
+
+            # Broadcast initial status to clients immediately (both methods for all pages)
+            self.socketio.emit("message", json.dumps({
+                "jsonrpc": "2.0",
+                "method": "update_data",
+                "params": {"id": j.id, "payload": {"status": "Starting"}}
+            }), broadcast=True)
+
+            self.socketio.emit("message", json.dumps({
+                "jsonrpc": "2.0",
+                "method": "update_shell_infos",
+                "params": {"id": j.id, "input": j.input, "status": "Starting"}
+            }), broadcast=True)
 
             self.jobs[j.id] = Job(self.socketio, j, self.app, self)
-            j_json["id"] = j.id
 
         return j_json
 
@@ -562,9 +727,12 @@ def job_watchdog_task(j_m) -> None:
         to_stop = []
         for k in j_m.jobs.keys():
 
-            if j_m.jobs[k].sq_job.pid is not None:
+            with j_m.app.app_context():
+                pid_val = j_m.jobs[k].sq_job.pid
+
+            if pid_val is not None:
                 if (
-                    not psutil.pid_exists(j_m.jobs[k].sq_job.pid)
+                    not psutil.pid_exists(pid_val)
                     and j_m.jobs[k].watchdog.is_alive()
                 ):
                     to_stop.append(k)
@@ -640,7 +808,10 @@ class Job:
         self.shell_content = deque()
 
         self.update_status = ""
-        self.status = ""
+        self.status = sq_job.status or ""  # Initialize from database status
+
+        # Store job_id to avoid accessing sq_job from background threads
+        self.job_id = sq_job.id
 
         # CPU core allocation
         self.allocated_cores: Optional[List[int]] = None
@@ -664,10 +835,26 @@ class Job:
             if (self.allocated_cores and
                 not self.job_manager.disable_intel_mpi_core_allocation and
                     "mpiexec" in command):
-                command = command.replace(
-                    "mpiexec",
-                    f"mpiexec -genv I_MPI_PIN=1 -genv I_MPI_PIN_PROCESSOR_LIST={self.allocated_cores[0]}-{self.allocated_cores[-1]}"
-                )
+                # Only apply pinning when hyper-threading is disabled for optimal performance
+                if not self.job_manager.core_allocator.hyper_threading_enabled:
+                    # Format core list: if consecutive, use range (0-7); otherwise use comma list (0,2,4,8,10,12)
+                    # Intel MPI supports both formats
+                    core_list_str = ",".join(map(str, self.allocated_cores))
+
+                    # Additional Intel MPI optimizations for better performance
+                    mpi_opts = [
+                        "-genv I_MPI_PIN=1",
+                        f"-genv I_MPI_PIN_PROCESSOR_LIST={core_list_str}",
+                        "-genv I_MPI_PIN_DOMAIN=core",  # Pin to physical cores
+                        "-genv I_MPI_FABRICS=shm",       # Use shared memory for intra-node communication
+                        "-genv OMP_NUM_THREADS=1",        # Prevent OpenMP nested parallelism conflicts
+                    ]
+                    command = command.replace(
+                        "mpiexec", "mpiexec " + " ".join(mpi_opts))
+                else:
+                    # When HT is enabled, let Intel MPI handle thread placement automatically
+                    # This often performs better than manual pinning with HT
+                    pass
 
             process = subprocess.Popen(
                 "cmd /c " + command + " > stdout 2>&1",
@@ -676,73 +863,12 @@ class Job:
                 | subprocess.CREATE_NO_WINDOW,
             )
 
-            # Wait and find the actual LS-DYNA process PID (not cmd.exe or mpiexec)
-            pid_to_write = process.pid
-            dyna_process_found = False
-
-            # Retry logic: wait up to 10 seconds for LS-DYNA process to start
-            for attempt in range(20):  # 20 attempts x 0.5s = 10 seconds max
-                sleep(0.5)
-                try:
-                    parent = psutil.Process(process.pid)
-                    children = parent.children(recursive=True)
-
-                    # Search for LS-DYNA process by name pattern
-                    for p in children:
-                        try:
-                            proc_name = p.name().lower()
-                            # Look for common LS-DYNA executable names
-                            if any(name in proc_name for name in ['ls-dyna', 'lsdyna', 'dyna', 'mpp']):
-                                pid_to_write = p.pid
-                                dyna_process_found = True
-                                print(
-                                    Fore.GREEN +
-                                    f"Found LS-DYNA process: {proc_name} (PID: {pid_to_write})" +
-                                    Style.RESET_ALL
-                                )
-                                break
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            continue
-
-                    if dyna_process_found:
-                        break
-
-                except psutil.NoSuchProcess:
-                    print(
-                        Fore.YELLOW +
-                        f"Warning: Parent process died during startup (attempt {attempt+1}/20)" +
-                        Style.RESET_ALL
-                    )
-                    break
-
-            if not dyna_process_found:
-                print(
-                    Fore.RED +
-                    f"ERROR: Could not find LS-DYNA process for job {self.sq_job.id}. " +
-                    f"Using fallback PID: {pid_to_write}" +
-                    Style.RESET_ALL
-                )
-                # Log all children for debugging
-                try:
-                    parent = psutil.Process(process.pid)
-                    children = parent.children(recursive=True)
-                    print(
-                        f"Available child processes: {[(p.pid, p.name()) for p in children]}")
-                except:
-                    pass
-
-            # Update the allocated cores with the actual PID (only if core allocation is enabled)
-            if self.allocated_cores and not self.job_manager.disable_intel_mpi_core_allocation:
-                with self.job_manager.core_allocator.lock:
-                    for core in self.job_manager.core_allocator.cores:
-                        if core['job_id'] == self.sq_job.id and core['pid'] == 0:
-                            core['pid'] = pid_to_write
-
-            # Write PID and allocated cores to file
+            # Write initial PID file immediately (will be updated by watchdog thread)
+            # This allows add_job() to return quickly to the client
             with open(
                 os.path.join(self.working_dir, "pid"), "w", encoding="utf-8"
             ) as file:
-                file.write(f"{pid_to_write}\n")
+                file.write(f"{process.pid}\n")  # Write cmd.exe PID temporarily
                 if self.allocated_cores and not self.job_manager.disable_intel_mpi_core_allocation:
                     file.write(json.dumps(
                         {"cores": self.allocated_cores}) + "\n")
@@ -784,12 +910,12 @@ class Job:
     def release_cores(self) -> None:
         """Release allocated cores when job ends"""
         if self.allocated_cores is not None:
-            self.job_manager.core_allocator.release_cores(self.sq_job.id)
+            self.job_manager.core_allocator.release_cores(self.job_id)
             self.allocated_cores = None
             # Clear from database as well
             with self.app.app_context():
                 try:
-                    query = SqlJob.query.filter_by(id=self.sq_job.id).one()
+                    query = SqlJob.query.filter_by(id=self.job_id).one()
                     query.allocated_cores = None
                     db.session.commit()
                 except:
@@ -809,7 +935,7 @@ class Job:
         if self.allocated_cores is not None:
             print(
                 Fore.YELLOW +
-                f"Warning: Cores still allocated at stop() for job {self.sq_job.id}, releasing as fallback" +
+                f"Warning: Cores still allocated at stop() for job {self.job_id}, releasing as fallback" +
                 Style.RESET_ALL
             )
             self.release_cores()
@@ -823,7 +949,7 @@ class Job:
         if len(content) > 0:
             self.shell_content += content
             self.socketio.emit("message", json.dumps({"jsonrpc": "2.0", "method": "appendToShell",
-                                                      "params": {"id": self.sq_job.id, "payload": "".join(content)}}), broadcast=True
+                                                      "params": {"id": self.job_id, "payload": "".join(content)}}), broadcast=True
                                )
 
     def get_shell_content(self) -> deque:
@@ -840,7 +966,7 @@ class Job:
         try:
 
             with self.app.app_context():
-                query = SqlJob.query.filter_by(id=self.sq_job.id).one()
+                query = SqlJob.query.filter_by(id=self.job_id).one()
 
                 # Update elapsed and ETA field every seconds
                 if not j_json:
@@ -934,15 +1060,19 @@ class Job:
                 except Exception as e:
                     print(
                         Fore.RED +
-                        f"ERROR: Failed to commit database for job {self.sq_job.id}: {e}" +
+                        f"ERROR: Failed to commit database for job {self.job_id}: {e}" +
                         Style.RESET_ALL
                     )
 
+            # Get input from database within app context for socketio message
+            with self.app.app_context():
+                input_val = self.sq_job.input
+
             self.socketio.emit("message", json.dumps({"jsonrpc": "2.0", "method": "update_data",
-                                                      "params": {"id": self.sq_job.id, "payload": j_json}}), broadcast=True
+                                                      "params": {"id": self.job_id, "payload": j_json}}), broadcast=True
                                )
             self.socketio.emit('message', json.dumps({"jsonrpc": "2.0", "method": "update_shell_infos",
-                                                      "params": {"id": self.sq_job.id, "input": self.sq_job.input, "status": self.status}}),  broadcast=True
+                                                      "params": {"id": self.job_id, "input": input_val, "status": self.status}}),  broadcast=True
                                )
 
         except:
@@ -952,7 +1082,7 @@ class Job:
         """Return the Job as a Json dict"""
         return json.dumps(
             {
-                "id": self.sq_job.id,
+                "id": self.job_id,
                 "allocated_cores": self.allocated_cores,
             },
             sort_keys=True,
@@ -1022,6 +1152,35 @@ class StdoutWatchdogThread(Thread):
         """Start the reading loop"""
 
         # ------------------------------------------------------------------------------
+        #                   IMMEDIATE STDOUT READ - Before any PID handling
+        # ------------------------------------------------------------------------------
+
+        # Check if stdout already exists and read it immediately
+        # This sends content to client ASAP, even before PID detection
+        pos = 0
+        actual_time = 0
+
+        if os.path.isfile(os.path.join(self.working_dir, "stdout")):
+            try:
+                pos, actual_time, to_add, json_f = self.readFile(
+                    pos, actual_time)
+                if to_add:
+                    self.job.update_shell(to_add)
+                if json_f:
+                    self.job.update_db(json_f)
+                print(
+                    Fore.GREEN +
+                    f"Pre-loaded {len(to_add)} lines from stdout for job {self.job.job_id}" +
+                    Style.RESET_ALL
+                )
+            except Exception as e:
+                print(
+                    Fore.YELLOW +
+                    f"Warning: Could not pre-load stdout for job {self.job.job_id}: {e}" +
+                    Style.RESET_ALL
+                )
+
+        # ------------------------------------------------------------------------------
         #                          GET PID in pid file
         # ------------------------------------------------------------------------------
 
@@ -1037,7 +1196,91 @@ class StdoutWatchdogThread(Thread):
 
             # First line is always the PID
             pid_line = lines[0].strip()
-            self.job.sq_job.pid = int(pid_line)
+
+            # Handle case where PID file might have literal \n instead of newline
+            # (old bug or file corruption)
+            if '\\n' in pid_line:
+                # Split on literal \n and take first part
+                pid_line = pid_line.split('\\n')[0]
+
+            # Also handle embedded JSON on same line
+            if '{' in pid_line:
+                pid_line = pid_line.split('{')[0].strip()
+
+            try:
+                initial_pid = int(pid_line)
+            except ValueError as e:
+                print(
+                    Fore.RED +
+                    f"ERROR: Failed to parse PID from file. Content: {repr(pid_line)}" +
+                    Style.RESET_ALL
+                )
+                raise
+
+            self.job.sq_job.pid = initial_pid
+
+            # For new jobs, search for mpiexec PID asynchronously in a separate thread
+            # This allows stdout reading to start immediately without waiting
+            if not self.j_connect:
+                def search_mpiexec():
+                    """Background thread to find and update mpiexec PID"""
+                    mpiexec_pid = None
+                    try:
+                        parent = psutil.Process(initial_pid)
+                        for attempt in range(10):  # Max 5 seconds
+                            children = parent.children(recursive=True)
+                            for p in children:
+                                try:
+                                    if 'mpiexec' in p.name().lower():
+                                        mpiexec_pid = p.pid
+                                        print(
+                                            Fore.GREEN +
+                                            f"Found mpiexec process (PID: {mpiexec_pid}) for job {self.job.job_id}" +
+                                            Style.RESET_ALL
+                                        )
+                                        break
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    continue
+
+                            if mpiexec_pid:
+                                break
+                            time.sleep(0.5)
+
+                        # Update PID if mpiexec found
+                        if mpiexec_pid:
+                            with self.job.app.app_context():
+                                self.job.sq_job.pid = mpiexec_pid
+
+                            # Update pid file
+                            with open(os.path.join(self.working_dir, "pid"), "w", encoding="utf-8") as f:
+                                f.write(f"{mpiexec_pid}\n")
+                                if len(lines) > 1:
+                                    f.write(lines[1])  # Keep cores info
+
+                            # Update allocated cores with mpiexec PID
+                            if self.job.allocated_cores and not self.job.job_manager.disable_intel_mpi_core_allocation:
+                                with self.job.job_manager.core_allocator.lock:
+                                    for core in self.job.job_manager.core_allocator.cores:
+                                        if core['job_id'] == self.job.job_id and core['pid'] == initial_pid:
+                                            core['pid'] = mpiexec_pid
+                        else:
+                            print(
+                                Fore.YELLOW +
+                                f"Warning: Could not find mpiexec for job {self.job.job_id}, using cmd.exe PID {initial_pid}" +
+                                Style.RESET_ALL
+                            )
+
+                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                        print(
+                            Fore.YELLOW +
+                            f"Warning: Error searching for mpiexec: {e}" +
+                            Style.RESET_ALL
+                        )
+
+                # Start mpiexec search in background thread
+                mpiexec_search_thread = Thread(
+                    target=search_mpiexec, daemon=True, name=f"mpiexec_search_{self.job.job_id}")
+                mpiexec_search_thread.start()
 
             # Only restore cores if this is a reconnection (j_connect=True)
             # For new jobs, cores are already allocated in __init__
@@ -1055,51 +1298,68 @@ class StdoutWatchdogThread(Thread):
                         pass
 
                 # 2. Fallback to database if pid file doesn't have cores
-                if not restored_cores and self.job.sq_job.allocated_cores:
-                    try:
-                        restored_cores = json.loads(
-                            self.job.sq_job.allocated_cores)
-                        print(
-                            Fore.YELLOW +
-                            f"Restoring cores from database for job {self.job.sq_job.id}" +
-                            Style.RESET_ALL
-                        )
-                    except (json.JSONDecodeError, ValueError):
-                        pass
+                if not restored_cores:
+                    with self.job.app.app_context():
+                        allocated_cores_str = self.job.sq_job.allocated_cores
+
+                    if allocated_cores_str:
+                        try:
+                            restored_cores = json.loads(allocated_cores_str)
+                            print(
+                                Fore.YELLOW +
+                                f"Restoring cores from database for job {self.job.job_id}" +
+                                Style.RESET_ALL
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            pass
 
                 # Try to allocate the same cores that were previously allocated
                 if restored_cores:
+                    with self.job.app.app_context():
+                        pid_val = self.job.sq_job.pid
                     allocated = self.job.job_manager.core_allocator.allocate_specific_cores(
-                        job_id=self.job.sq_job.id,
-                        pid=self.job.sq_job.pid,
+                        job_id=self.job.job_id,
+                        pid=pid_val,
                         core_indices=restored_cores
                     )
                     if allocated:
                         self.job.allocated_cores = allocated
                         print(
                             Fore.GREEN +
-                            f"Restored core allocation {allocated[0]}-{allocated[-1]} for job {self.job.sq_job.id}" +
+                            f"Restored core allocation {allocated[0]}-{allocated[-1]} for job {self.job.job_id}" +
                             Style.RESET_ALL
                         )
                     else:
                         # Fallback: allocate any available cores
+                        with self.job.app.app_context():
+                            pid_val = self.job.sq_job.pid
+                            ncpu_val = self.job.sq_job.ncpu
                         self.job.allocated_cores = self.job.job_manager.core_allocator.allocate_cores(
-                            job_id=self.job.sq_job.id,
-                            pid=self.job.sq_job.pid,
-                            num_cores=self.job.sq_job.ncpu
+                            job_id=self.job.job_id,
+                            pid=pid_val,
+                            num_cores=ncpu_val
                         )
                 else:
                     # No saved core data - allocate new cores
+                    with self.job.app.app_context():
+                        pid_val = self.job.sq_job.pid
+                        ncpu_val = self.job.sq_job.ncpu
                     self.job.allocated_cores = self.job.job_manager.core_allocator.allocate_cores(
-                        job_id=self.job.sq_job.id,
-                        pid=self.job.sq_job.pid,
-                        num_cores=self.job.sq_job.ncpu
+                        job_id=self.job.job_id,
+                        pid=pid_val,
+                        num_cores=ncpu_val
                     )
 
-            json_f = {"pid": int(pid_line), "status": "Starting"}
+            # Build update dict - don't override status to "Starting" if job already has it
+            json_f = {"pid": int(pid_line)}
             if not self.j_connect:
-                self.job.sq_job.started = int(time.time())
+                with self.job.app.app_context():
+                    self.job.sq_job.started = int(time.time())
+                    status_val = self.job.sq_job.status
                 json_f["started"] = int(time.time())
+                # Only set Starting status for new jobs, skip for reconnections
+                if status_val != "Starting":
+                    json_f["status"] = "Starting"
             self.job.update_db(json_f)
 
         # Write allocated cores back to pid file and database for future restarts
@@ -1107,8 +1367,10 @@ class StdoutWatchdogThread(Thread):
         # Only write cores if core allocation is enabled
         if (self.job.allocated_cores is not None and
                 not self.job.job_manager.disable_intel_mpi_core_allocation):
+            with self.job.app.app_context():
+                pid_val = self.job.sq_job.pid
             with open(os.path.join(self.working_dir, "pid"), "w", encoding="utf-8") as file:
-                file.write(f"{self.job.sq_job.pid}\n")
+                file.write(f"{pid_val}\n")
                 file.write(json.dumps(
                     {"cores": self.job.allocated_cores}) + "\n")
 
@@ -1125,35 +1387,33 @@ class StdoutWatchdogThread(Thread):
             self.observer.start()
             print(
                 Fore.CYAN +
-                f"File watcher started for job {self.job.sq_job.id}" +
+                f"File watcher started for job {self.job.job_id}" +
                 Style.RESET_ALL
             )
         except Exception as e:
             print(
                 Fore.YELLOW +
-                f"Warning: Could not start file watcher for job {self.job.sq_job.id}: {e}" +
+                f"Warning: Could not start file watcher for job {self.job.job_id}: {e}" +
                 Style.RESET_ALL
             )
 
-        # Actual byte position of the reader
-        pos = 0
-
-        # current job time to increment and compare
-        actual_time = 0
+        # Continue from where we left off (or start at 0 if no pre-load happened)
+        # pos and actual_time are already set from pre-load or initialized to 0
 
         while self.running:
-            json_f = {}
-
             if not os.path.isfile(os.path.join(self.working_dir, "stdout")):
                 time.sleep(1)
                 continue
 
             pos, actual_time, to_add, json_f = self.readFile(pos, actual_time)
 
-            # Mise à jour seulement si changements
-            if to_add or json_f:
-                self.job.update_db(json_f)
+            # Send updates - shell content first (even if status is Starting)
+            if to_add:
                 self.job.update_shell(to_add)
+
+            # Then update DB/status if there are changes
+            if json_f:
+                self.job.update_db(json_f)
 
             # Attendre notification du watchdog OU timeout de 5s (sécurité)
             # Si le fichier est modifié, read_event est déclenché immédiatement
@@ -1161,7 +1421,9 @@ class StdoutWatchdogThread(Thread):
             self.read_event.wait(timeout=5)
             self.read_event.clear()
 
-            if not psutil.pid_exists(self.job.sq_job.pid):
+            with self.job.app.app_context():
+                pid_val = self.job.sq_job.pid
+            if not psutil.pid_exists(pid_val):
                 break
 
         # Lecture finale après sortie de boucle
@@ -1178,6 +1440,13 @@ class StdoutWatchdogThread(Thread):
 
         Optimized version that accumulates all changes and performs a single DB update.
         """
+        # Pre-fetch all database values we need within app context
+        with self.job.app.app_context():
+            sq_status = self.job.sq_job.status
+            sq_a_mass = self.job.sq_job.a_mass
+            sq_pct_mass = self.job.sq_job.pct_mass
+            sq_end = self.job.sq_job.end
+
         with open(os.path.join(self.working_dir, "stdout"), "rb") as file:
             file.seek(pos)
             to_add = deque()
@@ -1206,34 +1475,35 @@ class StdoutWatchdogThread(Thread):
 
                 # === Status detection ===
                 if "Livermore  Software  Technology  Corporation" in line:
-                    if self.job.sq_job.status != "Running":
+                    if sq_status != "Running":
                         updates["status"] = "Running"
+                        sq_status = "Running"
 
                 # === Mass metrics ===
-                if "added mass          =" in line and self.job.sq_job.a_mass is None:
+                if "added mass          =" in line and sq_a_mass is None:
                     try:
                         a_mass = float(line.split()[-1])
-                        self.job.sq_job.a_mass = a_mass
                         updates["a_mass"] = a_mass
+                        sq_a_mass = a_mass
                     except (IndexError, ValueError) as e:
                         print(
                             f"Warning: Could not parse added mass from line: {line.strip()}")
 
-                if "percentage increase =" in line and self.job.sq_job.pct_mass is None:
+                if "percentage increase =" in line and sq_pct_mass is None:
                     try:
                         pct_mass = float(line.split()[-1])
-                        self.job.sq_job.pct_mass = pct_mass
                         updates["pct_mass"] = pct_mass
+                        sq_pct_mass = pct_mass
                     except (IndexError, ValueError):
                         print(
                             f"Warning: Could not parse pct_mass from line: {line.strip()}")
 
                 # === Termination time ===
-                if "termination time" in line and self.job.sq_job.end is None:
+                if "termination time" in line and sq_end is None:
                     try:
                         e_time = float(line.split()[-1])
-                        self.job.sq_job.end = e_time
                         updates["end"] = e_time
+                        sq_end = e_time
                     except (IndexError, ValueError):
                         pass
 
@@ -1242,7 +1512,6 @@ class StdoutWatchdogThread(Thread):
                     try:
                         c_time = float(line.split()[2])
                         if c_time > new_actual_time:
-                            self.job.sq_job.current = c_time
                             updates["current"] = c_time
                             new_actual_time = c_time
                     except (IndexError, ValueError):
@@ -1252,7 +1521,6 @@ class StdoutWatchdogThread(Thread):
                     try:
                         c_time = float(line.split()[-1])
                         if c_time > new_actual_time:
-                            self.job.sq_job.current = c_time
                             updates["current"] = c_time
                             new_actual_time = c_time
                     except (IndexError, ValueError):
@@ -1265,13 +1533,18 @@ class StdoutWatchdogThread(Thread):
                     updates["status"] = "Error"
 
                 # === Normal termination ===
-                if "N o r m a l" in line and self.job.status not in ["sw1"]:
-                    if self.job.update_status:
-                        updates["status"] = self.job.update_status
-                    else:
-                        updates["status"] = "Finished"
-                        if self.job.sq_job.end:
-                            updates["current"] = self.job.sq_job.end
+                if "N o r m a l" in line:
+                    # If sw1 was requested via d3kil, apply it now
+                    if self.job.update_status == "sw1":
+                        updates["status"] = "sw1"
+                    # Skip normal termination if already in sw1 state
+                    elif self.job.status not in ["sw1"]:
+                        if self.job.update_status:
+                            updates["status"] = self.job.update_status
+                        else:
+                            updates["status"] = "Finished"
+                            if sq_end:
+                                updates["current"] = sq_end
 
         return pos, new_actual_time, to_add, updates
 
