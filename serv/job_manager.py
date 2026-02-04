@@ -626,8 +626,20 @@ class JobManager:
         with self.app.app_context():
             db.session.add(j)
             db.session.commit()
+
+            # Build complete job response with all fields
             j_json["id"] = j.id
-            j_json["status"] = "Starting"  # Add status to returned JSON
+            j_json["status"] = "Starting"
+            j_json["progress"] = j.progress
+            j_json["started"] = j.started
+            j_json["ETA"] = j.ETA
+            j_json["elapsed"] = j.elapsed
+            j_json["current"] = j.current
+            j_json["end"] = j.end
+            j_json["pid"] = j.pid
+            j_json["a_mass"] = j.a_mass
+            j_json["pct_mass"] = j.pct_mass
+            j_json["allocated_cores"] = j.allocated_cores
 
             # Broadcast initial status to clients immediately (both methods for all pages)
             self.socketio.emit("message", json.dumps({
@@ -639,7 +651,17 @@ class JobManager:
             self.socketio.emit("message", json.dumps({
                 "jsonrpc": "2.0",
                 "method": "update_shell_infos",
-                "params": {"id": j.id, "input": j.input, "status": "Starting"}
+                "params": {
+                    "id": j.id,
+                    "input": j.input,
+                    "status": "Starting",
+                    "started": j.started,
+                    "current": j.current,
+                    "end": j.end,
+                    "progress": j.progress,
+                    "ETA": j.ETA,
+                    "elapsed": j.elapsed
+                }
             }), broadcast=True)
 
             self.jobs[j.id] = Job(self.socketio, j, self.app, self)
@@ -1064,15 +1086,31 @@ class Job:
                         Style.RESET_ALL
                     )
 
-            # Get input from database within app context for socketio message
+            # Get input and other values from database within app context for socketio message
             with self.app.app_context():
                 input_val = self.sq_job.input
+                current_val = self.sq_job.current
+                end_val = self.sq_job.end
+                started_val = self.sq_job.started
+                progress_val = self.sq_job.progress
+                eta_val = self.sq_job.ETA
+                elapsed_val = self.sq_job.elapsed
 
             self.socketio.emit("message", json.dumps({"jsonrpc": "2.0", "method": "update_data",
                                                       "params": {"id": self.job_id, "payload": j_json}}), broadcast=True
                                )
             self.socketio.emit('message', json.dumps({"jsonrpc": "2.0", "method": "update_shell_infos",
-                                                      "params": {"id": self.job_id, "input": input_val, "status": self.status}}),  broadcast=True
+                                                      "params": {
+                                                          "id": self.job_id,
+                                                          "input": input_val,
+                                                          "status": self.status,
+                                                          "started": started_val,
+                                                          "current": current_val,
+                                                          "end": end_val,
+                                                          "progress": progress_val,
+                                                          "ETA": eta_val,
+                                                          "elapsed": elapsed_val
+                                                      }}),  broadcast=True
                                )
 
         except:

@@ -3,6 +3,9 @@ import os
 import shutil
 from pathlib import Path
 import signal
+import time
+import psutil
+from threading import Thread, Lock
 from typing import List
 from flask_socketio import SocketIO, emit, send
 from sqlalchemy import desc, true
@@ -22,6 +25,108 @@ socketio = SocketIO()
 # For normal operation (use all detected cores):
 job_manager = JobManager(socketio)
 # Or explicitly: job_manager = JobManager(socketio, max_usable_cores=None)
+
+
+# CPU monitoring state
+class CpuMonitor:
+    """Manages CPU usage monitoring with automatic start/stop based on client connections"""
+
+    def __init__(self, socketio_instance):
+        self.socketio = socketio_instance
+        self.active_clients = 0
+        self.lock = Lock()
+        self.monitoring_thread = None
+        self.running = False
+
+    def add_client(self):
+        """Called when a client connects to CPU monitoring"""
+        with self.lock:
+            self.active_clients += 1
+            print(
+                Fore.CYAN +
+                f"CPU monitor: Client connected (total: {self.active_clients})" +
+                Style.RESET_ALL
+            )
+            if self.active_clients == 1 and not self.running:
+                self._start_monitoring()
+
+    def remove_client(self):
+        """Called when a client disconnects from CPU monitoring"""
+        with self.lock:
+            self.active_clients = max(0, self.active_clients - 1)
+            print(
+                Fore.CYAN +
+                f"CPU monitor: Client disconnected (total: {self.active_clients})" +
+                Style.RESET_ALL
+            )
+            if self.active_clients == 0 and self.running:
+                self._stop_monitoring()
+
+    def _start_monitoring(self):
+        """Start the monitoring thread"""
+        self.running = True
+        self.monitoring_thread = Thread(
+            target=self._monitor_loop, daemon=True, name="CPUMonitor")
+        self.monitoring_thread.start()
+        print(
+            Fore.GREEN +
+            "CPU monitoring started" +
+            Style.RESET_ALL
+        )
+
+    def _stop_monitoring(self):
+        """Stop the monitoring thread"""
+        self.running = False
+        if self.monitoring_thread:
+            self.monitoring_thread.join(timeout=2)
+        print(
+            Fore.YELLOW +
+            "CPU monitoring stopped" +
+            Style.RESET_ALL
+        )
+
+    def _monitor_loop(self):
+        """Background thread that broadcasts CPU usage"""
+        # Initial measurement to establish baseline
+        psutil.cpu_percent(percpu=True, interval=None)
+
+        while self.running:
+            try:
+                # Get per-core CPU usage
+                cpu_percentages = psutil.cpu_percent(percpu=True, interval=1)
+
+                # Build core to job mapping
+                core_job_map = {}
+                for job in job_manager.jobs.values():
+                    if job.allocated_cores:
+                        for core_idx in job.allocated_cores:
+                            core_job_map[core_idx] = job.job_id
+
+                # Broadcast to all connected clients
+                self.socketio.emit(
+                    "message",
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "method": "cpuUsageUpdate",
+                        "params": {
+                            "cores": cpu_percentages,
+                            "core_job_map": core_job_map,
+                            "timestamp": time.time()
+                        }
+                    }),
+                    broadcast=True
+                )
+
+            except Exception as e:
+                print(
+                    Fore.RED +
+                    f"Error in CPU monitoring: {e}" +
+                    Style.RESET_ALL
+                )
+                time.sleep(1)
+
+
+cpu_monitor = CpuMonitor(socketio)
 
 
 def sqlJobRequestToList(sql_job_list) -> List[dict]:
@@ -88,6 +193,20 @@ def clean_folder(folder, clean_all=True):
 def handle_message(request):
     if response := dispatch(request):
         send(response, json=False)
+
+
+@socketio.on("start_cpu_monitoring")
+def handle_start_cpu_monitoring():
+    """Client requests to start receiving CPU usage updates"""
+    cpu_monitor.add_client()
+    emit("cpu_monitoring_started", {"status": "started"})
+
+
+@socketio.on("stop_cpu_monitoring")
+def handle_stop_cpu_monitoring():
+    """Client requests to stop receiving CPU usage updates"""
+    cpu_monitor.remove_client()
+    emit("cpu_monitoring_stopped", {"status": "stopped"})
 
 
 @method
